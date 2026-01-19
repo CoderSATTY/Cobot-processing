@@ -6,24 +6,14 @@ import numpy as np
 import supervision as sv
 from typing import List
 
-subprocess.run(["nvidia-smi"])
+#subprocess.run(["nvidia-smi"])
 
 HOME = os.getcwd()
 print("HOME:", HOME)
 
-subprocess.run(["which", "pip"])
-subprocess.run(["pip", "--version"])
-subprocess.run(["python", "-m", "ensurepip", "--upgrade"])
-subprocess.run(["python", "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"])
-subprocess.run([
-    "python", "-m", "pip", "install",
-    "torch", "torchvision", "torchaudio",
-    "--index-url", "https://download.pytorch.org/whl/cu121"
-])
-
-os.chdir("GroundingDINO")
-subprocess.run(["python", "-m", "pip", "install", "-e", ".", "--no-build-isolation"])
-os.chdir("..")
+#os.chdir("GroundingDINO")
+#subprocess.run(["python", "-m", "pip", "install", "-e", ".", "--no-build-isolation"])
+#os.chdir("..")
 
 os.makedirs("weights", exist_ok=True)
 
@@ -31,12 +21,12 @@ GROUNDING_DINO_CHECKPOINT_PATH = os.path.join(
     HOME, "weights", "groundingdino_swint_ogc.pth"
 )
 
-if not os.path.isfile(GROUNDING_DINO_CHECKPOINT_PATH):
-    subprocess.run([
-        "wget",
-        "-O", "weights/groundingdino_swint_ogc.pth",
-        "https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha/groundingdino_swint_ogc.pth"
-    ])
+#if not os.path.isfile(GROUNDING_DINO_CHECKPOINT_PATH):
+#    subprocess.run([
+#        "wget",
+#        "-O", "weights/groundingdino_swint_ogc.pth",
+#        "https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha/groundingdino_swint_ogc.pth"
+#    ])
 
 print(GROUNDING_DINO_CHECKPOINT_PATH, os.path.isfile(GROUNDING_DINO_CHECKPOINT_PATH))
 
@@ -52,7 +42,8 @@ print(GROUNDING_DINO_CONFIG_PATH, os.path.isfile(GROUNDING_DINO_CONFIG_PATH))
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("DEVICE:", DEVICE)
-
+import sys
+sys.path.insert(0, os.path.join(HOME, "GroundingDINO"))
 from groundingdino.util.inference import Model
 
 grounding_dino_model = Model(
