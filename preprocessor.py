@@ -1,241 +1,200 @@
-import os
-import sys
 import cv2
+import time
 import torch
-import numpy as np
-import supervision as sv
-from typing import List, Tuple, Optional
+import os
+from ultralytics import YOLO
 from groq import Groq
-from dotenv import load_dotenv
 
-load_dotenv()
-HOME = os.getcwd()
-sys.path.insert(0, os.path.join(HOME, "GroundingDINO"))
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-GROUNDING_DINO_CONFIG_PATH = os.path.join(
-    HOME, "GroundingDINO", "groundingdino", "config", "GroundingDINO_SwinT_OGC.py"
-)
-GROUNDING_DINO_CHECKPOINT_PATH = os.path.join(HOME, "weights", "groundingdino_swint_ogc.pth")
-SAM_CHECKPOINT_PATH = os.path.join(HOME, "weights", "sam_vit_h_4b8939.pth")
-
-BOX_THRESHOLD = 0.35
-TEXT_THRESHOLD = 0.25
-
+# Configuration
 CAMERA_INDEX = 1
+MODEL_PATH = "weights/yoloe-26l-seg.pt"
+SAVE_DIR = "images"
+SYSTEM_PROMPT_PATH = "system_prompt.txt"
 
-GROQ_API_KEY = os.getenv("GROQ_KEY")
+CONF_THRES = 0.05
+EDGE_MARGIN = 15        # Pixel buffer from edge (excludes partial objects)
+REQUIRED_STABILITY = 4  # Number of consistent frames required before capturing
 
-
-def load_models():
-    print(f"Loading models on {DEVICE}...")
-    
-    from groundingdino.util.inference import Model
-    grounding_dino = Model(
-        model_config_path=GROUNDING_DINO_CONFIG_PATH,
-        model_checkpoint_path=GROUNDING_DINO_CHECKPOINT_PATH,
-        device=str(DEVICE)
-    )
-    grounding_dino.model = grounding_dino.model.to(DEVICE)
-    
-    from segment_anything import sam_model_registry, SamPredictor
-    sam = sam_model_registry["vit_h"](checkpoint=SAM_CHECKPOINT_PATH).to(device=DEVICE)
-    sam_predictor = SamPredictor(sam)
-    
-    print("Models loaded successfully!")
-    return grounding_dino, sam_predictor
+groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
 
-def parse_query_to_objects(query: str) -> List[str]:
-    client = Groq(api_key=GROQ_API_KEY)
-    
-    response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[
-            {
-                "role": "system",
-                "content": """You are an object extraction assistant for a robotic vision system.
-Given a natural language command, extract ONLY the TARGET object on which the action is to be performed.
-
-Rules:
-- Return ONLY the single target object name that the action is being performed ON
-- IGNORE reference objects used for location (e.g., "near cup", "beside table", "on shelf")
-- Use singular nouns (e.g., "button" not "buttons")
-- Keep names simple and concrete
-- Focus ONLY on what is being acted upon - pick, grab, press, move, find, etc.
-
-Examples:
-- "pick up the orange" -> orange
-- "grab the red cup near the laptop" -> cup
-- "press the emergency stop button near cup" -> stop button
-- "move the book to the shelf" -> book
-- "find the screwdriver next to the toolbox" -> screwdriver
-- "press the power button on the machine" -> power button
-"""
-            },
-            {"role": "user", "content": query}
-        ],
-        temperature=0.1,
-        max_tokens=50
-    )
-    
-    objects_str = response.choices[0].message.content.strip()
-    target_object = objects_str.split(",")[0].strip().lower() if objects_str else ""
-    
-    print(f"Target object: {target_object}")
-    return target_object
+def load_system_prompt(filepath):
+    with open(filepath, 'r', encoding='utf-8') as f:
+        return f.read()
 
 
-def enhance_class_name(class_name: str) -> List[str]:
-    return [f"all {class_name}s"]
-
-
-def segment_objects(sam_predictor, image: np.ndarray, boxes: np.ndarray) -> np.ndarray:
-    sam_predictor.set_image(image)
-    masks = []
-    for box in boxes:
-        mask_predictions, scores, _ = sam_predictor.predict(
-            box=box,
-            multimask_output=True
+def extract_object_intent(user_input, system_prompt):
+    try:
+        chat_completion = groq_client.chat.completions.create(
+            messages=[
+                {
+                    "role": "system",
+                    "content": system_prompt
+                },
+                {
+                    "role": "user",
+                    "content": user_input
+                }
+            ],
+            model="llama-3.3-70b-versatile",
+            temperature=0.1,
+            max_tokens=50,
         )
-        masks.append(mask_predictions[np.argmax(scores)])
-    return np.array(masks) if masks else np.array([])
-
-
-def process_frame(
-    frame: np.ndarray,
-    target_object: str,
-    grounding_dino,
-    sam_predictor
-) -> Tuple[np.ndarray, dict]:
-    detections = grounding_dino.predict_with_classes(
-        image=frame,
-        classes=enhance_class_name(target_object),
-        box_threshold=BOX_THRESHOLD,
-        text_threshold=TEXT_THRESHOLD
-    )
-    
-    results = {
-        "target_object": target_object,
-        "num_detections": len(detections.xyxy),
-        "boxes": detections.xyxy.tolist() if len(detections.xyxy) > 0 else [],
-        "confidences": detections.confidence.tolist() if len(detections.confidence) > 0 else [],
-        "class_ids": detections.class_id.tolist() if detections.class_id is not None else []
-    }
-    
-    if len(detections.xyxy) > 0:
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        detections.mask = segment_objects(sam_predictor, frame_rgb, detections.xyxy)
         
-        mask_annotator = sv.MaskAnnotator()
-        box_annotator = sv.BoxAnnotator()
-        
-        annotated = mask_annotator.annotate(scene=frame.copy(), detections=detections)
-        annotated = box_annotator.annotate(scene=annotated, detections=detections)
-    else:
-        annotated = frame.copy()
-        print(f"No '{target_object}' detected!")
+        object_name = chat_completion.choices[0].message.content.strip()
+        return object_name
     
-    return annotated, results
+    except Exception as e:
+        print(f"Error with Groq API: {e}")
+        print("Falling back to direct input...")
+        return user_input.strip()
 
 
-class VideoCapture:
-    def __init__(self, camera_index: int = 0):
-        self.cap = cv2.VideoCapture(camera_index)
-        if not self.cap.isOpened():
-            raise RuntimeError(f"Cannot open camera {camera_index}")
-        print(f"Camera {camera_index} opened successfully")
+def is_box_fully_in_frame(box, frame_shape, margin):
+    """
+    Returns True if the bounding box is completely inside the frame 
+    (not touching edges within the margin).
+    """
+    h, w = frame_shape[:2]
+    x1, y1, x2, y2 = box
     
-    def grab_frame(self) -> Optional[np.ndarray]:
-        ret, frame = self.cap.read()
-        if not ret:
-            print("Failed to grab frame")
-            return None
-        return frame
+    # Check bounds
+    if x1 < margin: return False         # Touching Left
+    if y1 < margin: return False         # Touching Top
+    if x2 > (w - margin): return False   # Touching Right
+    if y2 > (h - margin): return False   # Touching Bottom
     
-    def show_preview(self, window_name: str = "Preview"):
-        frame = self.grab_frame()
-        if frame is not None:
-            cv2.imshow(window_name, frame)
-            cv2.waitKey(1)
-    
-    def release(self):
-        self.cap.release()
-        cv2.destroyAllWindows()
+    return True
 
 
 def main():
-    print("\n" + "="*60)
-    print("Video Feed Object Detection & Segmentation Pipeline")
-    print("="*60 + "\n")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}")
+
+    os.makedirs(SAVE_DIR, exist_ok=True)
+
+    system_prompt = load_system_prompt(SYSTEM_PROMPT_PATH)
     
-    grounding_dino, sam_predictor = load_models()
-    
-    video = VideoCapture(CAMERA_INDEX)
-    
-    print("\nReady! Type a command (e.g., 'pick up the orange') or 'quit' to exit.")
-    print("Press 'p' in the preview window to show live feed.\n")
-    
-    try:
-        while True:
-            video.show_preview("Live Feed - Press 'q' to close preview")
+    # Load YOLO model
+    start = time.perf_counter()
+    model = YOLO(MODEL_PATH).to(device)
+    end = time.perf_counter()
+    print(f"Model loading time: {end - start:.2f}s")
+
+    # Initialize camera
+    cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+    if not cap.isOpened():
+        raise RuntimeError("Camera could not be opened")
+
+    print("\nObject Detection System Ready!")
+
+    # QUERY LOOP
+    while True:
+        try:
+            user_input = input("\nWhat would you like to detect? (or 'q' to quit): ").strip()
+        except EOFError:
+            break
             
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
-                cv2.destroyWindow("Live Feed - Press 'q' to close preview")
+        if not user_input or user_input.lower() == 'q':
+            break
+        
+        # Extract object intent using LLM
+        print(f"\nProcessing: '{user_input}'")
+        target_class = extract_object_intent(user_input, system_prompt)
+        print(f"Detected object: '{target_class}'")
+        
+        model.set_classes([target_class])
+        print(f"Starting detection for: {target_class}")
+        print("-" * 50)
+
+        detected = False
+        stability_counter = 0  
+
+        while not detected:
+            start_loop = time.time()
+            ret, frame = cap.read()
             
-            import select
-            import sys
-            
-            print("\nEnter query (or 'quit'): ", end="", flush=True)
-            query = input().strip()
-            
-            if query.lower() == 'quit':
-                break
-            
-            if not query:
+            if not ret:
                 continue
+
+            results = model.predict(
+                frame,
+                conf=CONF_THRES,
+                task="segment",
+                verbose=False
+            )[0]
+
+            # Filter Detections
+            valid_box = None
             
-            print(f"\nProcessing: '{query}'")
+            if results.boxes is not None and len(results.boxes) > 0:
+                # Find the best box that is fully in frame
+                for i, box in enumerate(results.boxes):
+                    coords = box.xyxy[0].cpu().numpy()
+                    if is_box_fully_in_frame(coords, frame.shape, EDGE_MARGIN):
+                        valid_box = results[i]  # This is a valid complete object
+                        final_coords = coords  
+                        break 
+
+            # Stability Logic
+            annotated = frame.copy()
             
-            target_object = parse_query_to_objects(query)
+            if valid_box:
+                stability_counter += 1
+                annotated = valid_box.plot()
+                
+                # Display stability status
+                status_text = f"Stable: {stability_counter}/{REQUIRED_STABILITY}"
+                cv2.putText(annotated, status_text, (50, 50), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                
+                if stability_counter >= REQUIRED_STABILITY:
+                    detected = True  # Trigger exit
+                
+            else:
+                # Object lost or touching edge -> Reset counter
+                if stability_counter > 0:
+                    print(f"Stability lost (count was {stability_counter})")
+                stability_counter = 0
+                cv2.putText(annotated, "Searching...", (50, 50), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+            # Display
+            cv2.imshow("Live Feed", annotated)
             
-            if not target_object:
-                print("Could not extract target object from query. Try again.")
-                continue
-            
-            print("Capturing frame...")
-            frame = video.grab_frame()
-            
-            if frame is None:
-                print("Failed to capture frame!")
-                continue
-            
-            print(f"Running detection & segmentation for '{target_object}'...")
-            annotated_frame, results = process_frame(
-                frame, target_object, grounding_dino, sam_predictor
+            # Save Logic (Only if detected flag is set by stability logic)
+            if detected:
+                timestamp = int(time.time())
+                filename = f"{SAVE_DIR}/{target_class.replace(' ', '_')}_{timestamp}.jpg"
+                cv2.imwrite(filename, annotated)
+                print(f"\n✓ Saved detection: {filename}")
+                print(f"  Coordinates: {final_coords.tolist()}")
+                cv2.waitKey(500) 
+
+            latency_ms = (time.time() - start_loop) * 1000
+            cv2.setWindowTitle(
+                "Live Feed",
+                f"Live Feed | Latency: {latency_ms:.1f} ms"
             )
             
-            print(f"\nResults: {results['num_detections']} '{target_object}' detected")
-            for i, (box, conf) in enumerate(zip(results['boxes'], results['confidences'])):
-                print(f"  [{i+1}] Box: {[int(x) for x in box]}, Confidence: {conf:.2f}")
-            
-            cv2.imshow("Detection Result", annotated_frame)
-            
-            output_path = f"result_{len(os.listdir('.'))}.png"
-            cv2.imwrite(output_path, annotated_frame)
-            print(f"Saved to: {output_path}")
-            
-            print("\nPress any key in the result window to continue...")
-            cv2.waitKey(0)
-            cv2.destroyWindow("Detection Result")
-    
-    except KeyboardInterrupt:
-        print("\nInterrupted by user")
-    
-    finally:
-        video.release()
-        print("Camera released. Goodbye!")
+            # Exit CURRENT inference only
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                print("Stopping current inference.")
+                break
+
+        # Destroy windows after each query 
+        cv2.destroyAllWindows()
+
+        # Clear CUDA cache after each query 
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    # Cleanup
+    cap.release()
+    cv2.destroyAllWindows()
+    print("\nShutting down...")
 
 
 if __name__ == "__main__":
