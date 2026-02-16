@@ -1,124 +1,111 @@
-# Object Detection System with LLM Intent Recognition
+# Cobot Processing System: Autonomous Object Retrieval
 
-An intelligent object detection system that uses Groq LLM for natural language intent extraction and YOLO for real-time object detection.
+This project implements an autonomous object tracking and retrieval system using a **Syncro 5 Addverb Cobot**, **Realsense Depth Camera**, and **LLMs** for intent recognition.
 
-## Features
+It features a custom **TCP-based Cobot Controller SDK** that bypasses ROS for lightweight, direct control.
 
-- **Natural Language Input**: Describe what you want to detect in plain English
-- **LLM Intent Extraction**: Groq-powered agent extracts the object name from your query
-- **Real-time Detection**: YOLO-based object detection with live camera feed
-- **Stability Checking**: Ensures objects are fully in frame before capturing
-- **Automatic Saving**: Saves detected objects with timestamps
+## 🚀 Key Features
+- **Natural Language Command Interface**: Uses **Groq API (Llama 3)** to interpret commands (e.g., "pick up the red bottle").
+- **Custom Cobot SDK**: Direct TCP/IP control of the robot without ROS middleware.
+- **Real-time Visual Servoing**: Closed-loop control using YOLO detection to align the robot arm.
+- **Depth Sensing**: 3D localization using Intel RealSense.
 
-## Setup
+## 🛠️ Tech Stack
 
-1. **Install Dependencies**:
-   ```bash
-   pip install -r requirements.txt
-   ```
+### Hardware
+*   **Robot**: Syncro 5 (Addverb)
+*   **Camera**: Intel RealSense D435i
 
-2. **Set Groq API Key**:
-   ```bash
-   export GROQ_API_KEY="your_groq_api_key_here"
-   ```
-   
-   Or on Windows:
-   ```cmd
-   set GROQ_API_KEY=your_groq_api_key_here
-   ```
+### Software
+*   **Python 3.10+**
+*   **Cobot Controller SDK**: Custom Python wrapper for TCP socket communication.
+*   **Ultralytics YOLOv8**: Object Detection.
+*   **Groq API**: LLM Inference.
+*   **pyrealsense2**: Depth processing.
 
-3. **Prepare Model**:
-   - Place your YOLO model at `weights/yoloe-26l-seg.pt`
-   - Or update `MODEL_PATH` in the script
+---
 
-4. **Configure Camera**:
-   - Update `CAMERA_INDEX` if needed (default is 1)
+## 🤖 Cobot Controller SDK (@cobot)
 
-## Usage
+The system uses a custom python client library (made by teammate) to communicate with a C++ control server running on the robot hardware.
 
-Run the script:
-```bash
-python preprocessor.py
-```
+**Protocol:** TCP/IP Sockets (Port 5000)
+**Architecture:**
+*   **Server (C++)**: Runs on the robot, manages hardware safety, and executing motion primitives.
+*   **Client (Python)**: Sends byte-code commands (e.g., `b"j+1"` for "Jog Joint 1 Positive").
 
-Example interactions:
-```
-What would you like to detect? Find my water bottle
-Processing: 'Find my water bottle'
-Detected object: 'bottle'
-Starting detection for: bottle
-
-What would you like to detect? I need to see if there's a person in the room
-Processing: 'I need to see if there's a person in the room'
-Detected object: 'person'
-Starting detection for: person
-
-What would you like to detect? Detect my laptop
-Processing: 'Detect my laptop'
-Detected object: 'laptop'
-Starting detection for: laptop
-```
-
-## How It Works
-
-1. **User Input**: Enter a natural language query describing what to detect
-2. **LLM Processing**: Groq LLM extracts the specific object name
-3. **YOLO Detection**: YOLO model detects the object in real-time
-4. **Stability Check**: System waits for object to be stable and fully in frame
-5. **Auto-Save**: Image is saved when detection is stable
-
-## Configuration
-
-Edit these parameters in `preprocessor.py`:
+### Key Methods
+The `Cobot` class abstracts the socket handling:
 
 ```python
-CAMERA_INDEX = 1              # Camera to use
-MODEL_PATH = "weights/..."    # YOLO model path
-CONF_THRES = 0.05            # Detection confidence threshold
-EDGE_MARGIN = 15             # Pixel buffer from edges
-REQUIRED_STABILITY = 4       # Frames needed for stable detection
+from cobot import Cobot, Dirn
+
+with Cobot("192.168.x.x", "password") as bot:
+    bot.connect()
+    
+    # Movement Control
+    bot.setVelocity(2.0)                  # Set speed scalar
+    bot.jogJoint(Dirn.POSITIVE, 0)        # Move Base Joint
+    bot.jogCartesianRelative(Dirn.NEGATIVE, 1) # Move Tool Frame Y-axis
+    bot.stopJogging()                     # Immediate Halt
+    
+    # Gipper open & close
+    bot.gripperOpen()
+    bot.gripperClose()
+    
+    # Recovery
+    bot.baseRigid()                       # Return to home position
 ```
 
-## System Prompt
+---
 
-The LLM behavior is controlled by `system_prompt.txt`. This file contains:
-- Instructions for object extraction
-- Few-shot examples for better accuracy
-- Rules for handling different input formats
+## 🔄 Autonomous Pipeline (`detect.py`)
 
-You can modify this file to improve intent recognition for your specific use case.
+The `detect.py` script orchestrates the full autonomous retrieval loop. Here is the step-by-step pipeline:
 
-## Troubleshooting
+### 1. Initialization & Connection
+*   Connects to the Cobot via TCP (`bot.connect()`).
+*   Starts the RealSense pipeline (Color + Depth streams).
+*   Loads the YOLO model and Groq client.
 
-**Camera not opening**: 
-- Check `CAMERA_INDEX` value
-- Try different values (0, 1, 2, etc.)
+### 2. Intent Recognition
+*   **Input**: User types "Find the blue cup".
+*   **LLM Processing**: `CommandParser` uses Llama 3 via Groq to exact the target class -> `cup`.
+*   **YOLO Config**: The model resets to track only the `cup` class.
 
-**Groq API errors**:
-- Verify your API key is set correctly
-- Check internet connection
-- System will fall back to direct input if API fails
+### 3. Search Phase
+*   The robot executes a `jogJoint` command to scan the environment until the target object is detected by YOLO.
 
-**Detection issues**:
-- Adjust `CONF_THRES` for sensitivity
-- Modify `EDGE_MARGIN` for edge detection
-- Change `REQUIRED_STABILITY` for faster/slower capture
+### 4. Visual Servoing (Alignment Loop)
+Once detected, the system enters a PID-like control loop to center the object in the camera frame:
 
-## File Structure
+*   **Error Calculation**:
+    *   `dx = object_center_x - frame_center_x`
+    *   `dy = object_center_y - frame_center_y`
+*   **Control Logic**:
+    *   **X-Axis Alignment**:
+        *   If `dx > threshold`: Command `jogCartesianRelative(POSITIVE, 0)` (Move Right).
+        *   If `dx < -threshold`: Command `jogCartesianRelative(NEGATIVE, 0)` (Move Left).
+    *   **Y-Axis Alignment**:
+        *   If `dy > threshold`: Command `jogCartesianRelative(NEGATIVE, 1)` (Move Back).
+        *   If `dy < -threshold`: Command `jogCartesianRelative(POSITIVE, 1)` (Move Forward).
+    *   **Distance Check**: The Depth camera verifies the object is within reach.
+
+### 5. Pickup Sequence
+When `dx` and `dy` are both within the threshold (Aligned):
+1.  **Stop**: `bot.stopJogging()`
+2.  **Approach**: Move down (`jogCartesianRelative`) and forward to the object coordinates.
+3.  **Grasp**: `bot.gripperClose()` (Logic reserved but not fully implemented in provided script).
+4.  **Retract**: `bot.baseRigid()` to lift the object.
+
+---
+
+## 📂 File Structure
 
 ```
 .
-├── preprocessor.py          # Main script
-├── system_prompt.txt        # LLM system prompt with examples
-├── requirements.txt         # Python dependencies
-├── weights/
-│   └── yoloe-26l-seg.pt    # YOLO model
-└── images/                  # Saved detections (auto-created)
+├── detect.py            # Main autonomous servoing loop
+├── preprocessor.py      # Camera calibration utility
+├── requirements.txt     # Dependencies
+└── README.md            # Documentation
 ```
-
-## License
-
-This project uses:
-- Ultralytics YOLO (AGPL-3.0)
-- Groq API (check Groq's terms)
-- OpenCV (Apache 2.0)

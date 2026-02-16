@@ -1,201 +1,103 @@
+import pyrealsense2 as rs
+import numpy as np
 import cv2
-import time
-import torch
-import os
-from ultralytics import YOLO
-from groq import Groq
 
-# Configuration
-CAMERA_INDEX = 1
-MODEL_PATH = "weights/yoloe-26l-seg.pt"
-SAVE_DIR = "images"
-SYSTEM_PROMPT_PATH = "system_prompt.txt"
+pipeline = rs.pipeline()
+config = rs.config()
+pipeline_wrapper = rs.pipeline_wrapper(pipeline)
+pipeline_profile = config.resolve(pipeline_wrapper)
+device = pipeline_profile.get_device()
 
-CONF_THRES = 0.05
-EDGE_MARGIN = 15        # Pixel buffer from edge (excludes partial objects)
-REQUIRED_STABILITY = 4  # Number of consistent frames required before capturing
+found_rgb = False
+for s in device.sensors:
+    if s.get_info(rs.camera_info.name) == 'RGB Camera':
+        found_rgb = True
+        break
+if not found_rgb:
+    print("Requires Depth camera with Color sensor")
+    exit(0)
 
-groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
+config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+pipeline.start(config)
 
+def get_coordinates_in_initial_frame(
+    d, px, py, depth_intrin,
+    yaw_rad, cam_height_cm, tilt_deg
+):
+    tilt_rad = np.radians(tilt_deg)
 
-def load_system_prompt(filepath):
-    with open(filepath, 'r', encoding='utf-8') as f:
-        return f.read()
+    # Deproject
+    x_c, y_c, z_c = rs.rs2_deproject_pixel_to_point(
+        depth_intrin, [px, py], d
+    )
 
+    # meters → cm
+    x_c *= 100
+    y_c *= 100
+    z_c *= 100
 
-def extract_object_intent(user_input, system_prompt):
-    try:
-        chat_completion = groq_client.chat.completions.create(
-            messages=[
-                {
-                    "role": "system",
-                    "content": system_prompt
-                },
-                {
-                    "role": "user",
-                    "content": user_input
-                }
-            ],
-            model="llama-3.3-70b-versatile",
-            temperature=0.1,
-            max_tokens=50,
-        )
-        
-        object_name = chat_completion.choices[0].message.content.strip()
-        return object_name
-    
-    except Exception as e:
-        print(f"Error with Groq API: {e}")
-        print("Falling back to direct input...")
-        return user_input.strip()
+    #Pitch (tilt about X) 
+    x1 = x_c
+    y1 = z_c * np.cos(tilt_rad) 
+    z1 = z_c * np.sin(tilt_rad)
 
+    #z_w =  z1
 
-def is_box_fully_in_frame(box, frame_shape, margin):
-    """
-    Returns True if the bounding box is completely inside the frame 
-    (not touching edges within the margin).
-    """
-    h, w = frame_shape[:2]
-    x1, y1, x2, y2 = box
-    
-    # Check bounds
-    if x1 < margin: return False         # Touching Left
-    if y1 < margin: return False         # Touching Top
-    if x2 > (w - margin): return False   # Touching Right
-    if y2 > (h - margin): return False   # Touching Bottom
-    
-    return True
+    # Yaw (about Z)
+    #x_w = x1 * np.cos(yaw_rad) - y1 * np.sin(yaw_rad)
+    #y_w = x1 * np.sin(yaw_rad) + y1 * np.cos(yaw_rad)
+
+    #return x_w, y_w, z_w
+    return x1, y1, z1
 
 
-def main():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Using device: {device}")
-
-    os.makedirs(SAVE_DIR, exist_ok=True)
-
-    system_prompt = load_system_prompt(SYSTEM_PROMPT_PATH)
-    
-    # Load YOLO model
-    start = time.perf_counter()
-    model = YOLO(MODEL_PATH).to(device)
-    end = time.perf_counter()
-    print(f"Model loading time: {end - start:.2f}s")
-
-    # Initialize camera
-    cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
-    if not cap.isOpened():
-        raise RuntimeError("Camera could not be opened")
-
-    print("\nObject Detection System Ready!")
-
-    # QUERY LOOP
+try:
     while True:
-        try:
-            user_input = input("\nWhat would you like to detect? (or 'q' to quit): ").strip()
-        except EOFError:
-            break
-            
-        if not user_input or user_input.lower() == 'q':
-            break
+        CAMERA_HEIGHT_CM = 52.0  
+        CAMERA_TILT_DEG = 60.0     
+        CURRENT_YAW_DEG = 0  
         
-        # Extract object intent using LLM
-        print(f"\nProcessing: '{user_input}'")
-        target_class = extract_object_intent(user_input, system_prompt)
-        print(f"Detected object: '{target_class}'")
+        yaw_rad = np.radians(CURRENT_YAW_DEG)
         
-        model.set_classes([target_class])
-        print(f"Starting detection for: {target_class}")
-        print("-" * 50)
+        frames = pipeline.wait_for_frames()
+        depth_frame = frames.get_depth_frame()
+        color_frame = frames.get_color_frame()
+        if not depth_frame or not color_frame: continue
 
-        detected = False
-        stability_counter = 0  
+        depth_intrin = depth_frame.profile.as_video_stream_profile().intrinsics
+        bbox_i = [198.82777404785156, 0.29718017578125, 415.8533935546875, 253.65660095214844]  
+        bbox = [int(b) for b in bbox_i]
+        px, py = (bbox[0] + bbox[2])//2, (bbox[1] + bbox[3])//2
 
-        while not detected:
-            start_loop = time.time()
-            ret, frame = cap.read()
-            
-            if not ret:
-                continue
-
-            results = model.predict(
-                frame,
-                conf=CONF_THRES,
-                task="segment",
-                verbose=False
-            )[0]
-
-            # Filter Detections
-            valid_box = None
-            
-            if results.boxes is not None and len(results.boxes) > 0:
-                # Find the best box that is fully in frame
-                for i, box in enumerate(results.boxes):
-                    coords = box.xyxy[0].cpu().numpy()
-                    if is_box_fully_in_frame(coords, frame.shape, EDGE_MARGIN):
-                        valid_box = results[i]  # This is a valid complete object
-                        final_coords = coords  
-                        break 
-
-            # Stability Logic
-            annotated = frame.copy()
-            
-            if valid_box:
-                stability_counter += 1
-                annotated = valid_box.plot()
-                
-                # Display stability status
-                status_text = f"Stable: {stability_counter}/{REQUIRED_STABILITY}"
-                cv2.putText(annotated, status_text, (50, 50), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                
-                if stability_counter >= REQUIRED_STABILITY:
-                    detected = True  # Trigger exit
-                
-            else:
-                # Object lost or touching edge -> Reset counter
-                if stability_counter > 0:
-                    print(f"Stability lost (count was {stability_counter})")
-                stability_counter = 0
-                cv2.putText(annotated, "Searching...", (50, 50), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-
-            # Display
-            cv2.imshow("Live Feed", annotated)
-            
-            # Save Logic (Only if detected flag is set by stability logic)
-            if detected:
-                timestamp = int(time.time())
-                filename = f"{SAVE_DIR}/{target_class.replace(' ', '_')}_{timestamp}.jpg"
-                cv2.imwrite(filename, annotated)
-                print(f"\n✓ Saved detection: {filename}")
-                print(f"  Coordinates: {final_coords.tolist()}")
-                cv2.waitKey(500) 
-
-            latency_ms = (time.time() - start_loop) * 1000
-            cv2.setWindowTitle(
-                "Live Feed",
-                f"Live Feed | Latency: {latency_ms:.1f} ms"
+        width, height = depth_intrin.width, depth_intrin.height
+        ocx, ocy = width//2, height//2
+        #px, py = width // 2, height // 2
+        
+        dist = depth_frame.get_distance(px, py)
+        
+        if dist > 0:
+            rx, ry, rz = get_coordinates_in_initial_frame(
+                dist, px, py, depth_intrin, yaw_rad, CAMERA_HEIGHT_CM, CAMERA_TILT_DEG
             )
+
+            print(f"Initial Frame -> X: {rx:6.2f} | Y: {ry:6.2f} | Z (Height): {rz:6.2f} cm")
+
+        depth_image = np.asanyarray(depth_frame.get_data())
+        color_image = np.asanyarray(color_frame.get_data())
+        
+        cv2.circle(color_image, (px, py), 5, (0, 255, 0), -1)
+        cv2.circle(color_image, (ocx, ocy), 5, (255, 0, 0), -1)
+        depth_colormap = cv2.applyColorMap(cv2.convertScaleAbs(depth_image, alpha=0.5), cv2.COLORMAP_JET)
+        
+        # Stack images safely
+        if depth_colormap.shape != color_image.shape:
+            color_image = cv2.resize(color_image, (depth_colormap.shape[1], depth_colormap.shape[0]))
             
-            # Exit CURRENT inference only
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                print("Stopping current inference.")
-                break
-
-        # Destroy windows after each query 
-        cv2.destroyAllWindows()
-
-        # Clear CUDA cache after each query 
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-    # Cleanup
-    cap.release()
-    cv2.destroyAllWindows()
-    print("\nShutting down...")
-
-
-if __name__ == "__main__":
-    main()
+        cv2.imshow('RealSense', np.hstack((color_image, depth_colormap)))
+        
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+            
+finally:
+    pipeline.stop()
