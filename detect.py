@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 from groq import Groq
 from ultralytics import YOLO
 from cobot import Cobot, Dirn
+from stt import speech_to_text, speech_to_text_whisper
 
 load_dotenv()
 
@@ -75,7 +76,9 @@ class BBoxTracker:
 
 def intent_identification(parser):
     try:
-        user_input = input("Enter query: ").strip()
+        #user_input = speech_to_text()
+        #user_input = input("Enter query: ").strip()
+        user_input = speech_to_text_whisper()
         if not user_input:
             return None
     except (EOFError, KeyboardInterrupt):
@@ -133,6 +136,7 @@ def shutdown(bot, pipeline):
     cv2.destroyAllWindows()
     bot.disconnect()
 
+    
 
 def detect():
     bot = Cobot("10.202.4.214", "cobot1234")

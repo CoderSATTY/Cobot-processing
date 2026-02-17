@@ -5,7 +5,8 @@ This project implements an autonomous object tracking and retrieval system using
 It features a custom **TCP-based Cobot Controller SDK** that bypasses ROS for lightweight, direct control.
 
 ## 🚀 Key Features
-- **Natural Language Command Interface**: Uses **Groq API (Llama 3)** to interpret commands (e.g., "pick up the red bottle").
+- **Voice Command Interface**: Uses **OpenAI Whisper (via Groq)** for fast and accurate speech-to-text.
+- **Natural Language Understanding**: Uses **Groq API (Llama 3)** to interpret commands (e.g., "pick up the red bottle").
 - **Custom Cobot SDK**: Direct TCP/IP control of the robot without ROS middleware.
 - **Real-time Visual Servoing**: Closed-loop control using YOLO detection to align the robot arm.
 - **Depth Sensing**: 3D localization using Intel RealSense.
@@ -15,13 +16,15 @@ It features a custom **TCP-based Cobot Controller SDK** that bypasses ROS for li
 ### Hardware
 *   **Robot**: Syncro 5 (Addverb)
 *   **Camera**: Intel RealSense D435i
+*   **Microphone**: Standard USB or built-in mic.
 
 ### Software
 *   **Python 3.10+**
 *   **Cobot Controller SDK**: Custom Python wrapper for TCP socket communication.
 *   **Ultralytics YOLOv8**: Object Detection.
-*   **Groq API**: LLM Inference.
+*   **Groq API**: LLM Inference & Whisper STT.
 *   **pyrealsense2**: Depth processing.
+*   **SpeechRecognition**: Audio capture.
 
 ---
 
@@ -31,7 +34,7 @@ The system uses a custom python client library (made by teammate) to communicate
 
 **Protocol:** TCP/IP Sockets (Port 5000)
 **Architecture:**
-*   **Server (C++)**: Runs on the robot, manages hardware safety, and executing motion primitives.
+*   **Server (C++)**: Runs on the robot, manages hardware safety, and execution of motion primitives.
 *   **Client (Python)**: Sends byte-code commands (e.g., `b"j+1"` for "Jog Joint 1 Positive").
 
 ### Key Methods
@@ -69,8 +72,8 @@ The `detect.py` script orchestrates the full autonomous retrieval loop. Here is 
 *   Loads the YOLO model and Groq client.
 
 ### 2. Intent Recognition
-*   **Input**: User types "Find the blue cup".
-*   **LLM Processing**: `CommandParser` uses Llama 3 via Groq to exact the target class -> `cup`.
+*   **Input**: User speaks "Find the blue cup" (captured via `stt.py` using Whisper).
+*   **LLM Processing**: `CommandParser` uses Llama 3 via Groq to extract the target class -> `cup`.
 *   **YOLO Config**: The model resets to track only the `cup` class.
 
 ### 3. Search Phase
