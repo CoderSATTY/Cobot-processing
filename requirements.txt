@@ -1,4 +1,7 @@
 opencv-python>=4.8.0
-torch>=2.0.0
+numpy>=1.24.0
+pyrealsense2>=2.50.0
 ultralytics>=8.0.0
 groq>=0.4.0
+python-dotenv>=1.0.0
+torch>=2.0.0
